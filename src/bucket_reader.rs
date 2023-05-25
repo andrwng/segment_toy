@@ -1,6 +1,6 @@
 use crate::error::BucketReaderError;
 use crate::fundamental::{NTP, NTPR, NTR};
-use crate::remote_types::{ArchivePartitionManifest, PartitionManifest, TopicManifest};
+use crate::remote_types::{ArchivePartitionManifest, ClusterMetadataManifest, PartitionManifest, TopicManifest};
 use futures::stream::{BoxStream, Stream};
 use futures::{stream, StreamExt};
 use lazy_static::lazy_static;
@@ -9,7 +9,7 @@ use object_store::{GetResult, ObjectStore};
 use regex::Regex;
 use serde::Serialize;
 use serde_json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -56,6 +56,19 @@ pub struct Anomalies {
 
     /// Segments referenced by a manifest, which do not exist in the bucket
     pub missing_segments: Vec<String>,
+
+    /// NTPR that failed consistency checks on its segments' metadata
+    pub ntpr_bad_offsets: HashSet<NTPR>,
+
+    /// Files referenced by the cluster manifest with the highest metadata ID which do not exist in
+    /// the bucket.
+    pub inconsistent_cluster_metadata: Vec<ClusterMetadata>,
+
+    /// ClusterMetadataManifest that could not be loaded
+    pub malformed_cluster_manifests: Vec<String>,
+
+    /// Controller snapshot that could not be loaded
+    pub malformed_controller_snapshot: Vec<String>,
 }
 
 impl Anomalies {
@@ -157,6 +170,10 @@ impl Anomalies {
             ntr_no_topic_manifest: HashSet::new(),
             unknown_keys: vec![],
             missing_segments: vec![],
+            ntpr_bad_offsets: HashSet::new(),
+            inconsistent_cluster_metadata: vec![],
+            malformed_cluster_manifests: vec![],
+            malformed_controller_snapshot: vec![],
         }
     }
 }
@@ -189,11 +206,18 @@ impl PartitionMetadata {
     }
 }
 
+#[derive(Default, Clone, Serialize)]
+pub struct ClusterMetadata {
+    pub manifests: BTreeMap<i64, ClusterMetadataManifest>,
+    pub controller_snapshots: HashSet<String>,
+}
+
 /// Find all the partitions and their segments within a bucket
 pub struct BucketReader {
     pub partitions: HashMap<NTPR, PartitionObjects>,
     pub partition_manifests: HashMap<NTPR, PartitionMetadata>,
     pub topic_manifests: HashMap<NTR, TopicManifest>,
+    pub cluster_metadata: HashMap<String, ClusterMetadata>,
     pub anomalies: Anomalies,
     pub client: Arc<dyn ObjectStore>,
 }
@@ -207,6 +231,7 @@ impl BucketReader {
             partitions: HashMap::new(),
             partition_manifests: HashMap::new(),
             topic_manifests: HashMap::new(),
+            cluster_metadata: HashMap::new(),
             anomalies: Anomalies::new(),
             client,
         }
@@ -239,6 +264,12 @@ impl BucketReader {
             } else if key.contains("manifest.json_") || key.contains("manifest.bin_") {
                 debug!("Parsing partition archive manifest key {}", key);
                 self.ingest_archive_manifest(&key).await?;
+            } else if key.ends_with("/cluster_manifest.json") {
+                debug!("Parsing cluster metadata manifest key {}", key);
+                self.ingest_cluster_metadata_manifest(&key).await?;
+            } else if key.ends_with("/controller.snapshot") {
+                debug!("Parsing controller snapshot key {}", key);
+                self.ingest_controller_snapshot(&key);
             } else if key.ends_with(".index") {
                 // TODO: do something with index files: currently ignore them as they are
                 // somewhat disposable.
@@ -360,6 +391,56 @@ impl BucketReader {
             partition_objects
                 .segment_objects
                 .sort_by_key(|so| so.base_offset);
+        }
+        debug!(
+            "Loaded metadata from {} clusters",
+            self.cluster_metadata.len()
+        );
+        for (cluster_uuid, meta) in &mut self.cluster_metadata {
+            debug!(
+                "Loaded {} cluster metadata manifests and {} controller snapshots from cluster {}",
+                meta.manifests.len(),
+                meta.controller_snapshots.len(),
+                cluster_uuid
+            );
+            let highest_manifest = if let Some((_, manifest)) =
+                meta.manifests.iter().max_by_key(|(_, m)| m.cluster_metadata_id)
+            {
+                manifest
+            } else {
+                warn!("No manifests for cluster {}", cluster_uuid);
+                self.anomalies
+                    .inconsistent_cluster_metadata
+                    .push(meta.clone());
+                continue;
+            };
+            if highest_manifest.controller_snapshot_path.is_empty() {
+                if highest_manifest.controller_snapshot_path.is_empty() {
+                    debug!("No controller snapshot for cluster {}", cluster_uuid);
+                } else {
+                    warn!(
+                        "Cluster {} has {} controller snapshots but manifest is empty",
+                        cluster_uuid,
+                        meta.controller_snapshots.len()
+                    );
+                    self.anomalies
+                        .inconsistent_cluster_metadata
+                        .push(meta.clone());
+                }
+                continue;
+            }
+            if !meta
+                .controller_snapshots
+                .contains(&highest_manifest.controller_snapshot_path)
+            {
+                warn!(
+                    "Cluster {} manifest points at snapshot {} but it doesn't exist in bucket",
+                    cluster_uuid, highest_manifest.controller_snapshot_path
+                );
+                self.anomalies
+                    .inconsistent_cluster_metadata
+                    .push(meta.clone());
+            }
         }
         Ok(())
     }
@@ -540,6 +621,66 @@ impl BucketReader {
         } else {
             warn!("Malformed partition manifest key {}", key);
             self.anomalies.malformed_manifests.push(key.to_string());
+        }
+        Ok(())
+    }
+
+
+    fn ingest_controller_snapshot(&mut self, key: &str) {
+        lazy_static! {
+            static ref CONTROLLER_SNAPSHOT_KEY: Regex =
+                Regex::new("cluster_metadata/([-a-f0-9]+)/[^]]+/controller.snapshot").unwrap();
+        }
+        if let Some(grps) = CONTROLLER_SNAPSHOT_KEY.captures(key) {
+            let cluster_uuid = grps.get(1).unwrap().as_str().to_string();
+            let cluster_meta = self.cluster_metadata.entry(cluster_uuid).or_default();
+            cluster_meta.controller_snapshots.insert(key.to_string());
+        } else {
+            self.anomalies
+                .malformed_controller_snapshot
+                .push(key.to_string());
+        }
+    }
+
+    async fn ingest_cluster_metadata_manifest(
+        &mut self,
+        key: &str,
+    ) -> Result<(), BucketReaderError> {
+        lazy_static! {
+            static ref CLUSTER_METADATA_MANIFEST_KEY: Regex =
+                Regex::new("cluster_metadata/([-a-f0-9]+)/manifests/([^]]+)/cluster_manifest.json")
+                    .unwrap();
+        }
+        if let Some(grps) = CLUSTER_METADATA_MANIFEST_KEY.captures(key) {
+            let cluster_uuid = grps.get(1).unwrap().as_str().to_string();
+            let meta_id_res = grps.get(2).unwrap().as_str().parse::<i64>();
+            let meta_id: i64;
+            let meta_id = if let Ok(id) = meta_id_res {
+                id
+            } else {
+                warn!("Malformed cluster metadata manifest metadata ID {}", key);
+                self.anomalies
+                    .malformed_cluster_manifests
+                    .push(key.to_string());
+                return Ok(());
+            };
+
+            let cluster_meta = self.cluster_metadata.entry(cluster_uuid).or_default();
+            let path = object_store::path::Path::from(key);
+            let bytes = self.client.get(&path).await?.bytes().await?;
+            if let Ok(manifest) = serde_json::from_slice::<ClusterMetadataManifest>(&bytes) {
+                cluster_meta.manifests.insert(meta_id, manifest);
+            } else {
+                warn!("Error parsing JSON cluster metadata manifest {}", key);
+                self.anomalies
+                    .malformed_cluster_manifests
+                    .push(key.to_string());
+            }
+        } else {
+            warn!("Malformed cluster metadata manifest key {}", key);
+            self.anomalies
+                .malformed_cluster_manifests
+                .push(key.to_string());
         }
         Ok(())
     }
