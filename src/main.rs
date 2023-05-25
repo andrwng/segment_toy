@@ -168,6 +168,9 @@ pub struct NTPDataScanResult {
     /// for Kafka offsets
     pub bad_offsets: bool,
 
+    /// One or more remote segments contained a gap in offsets.
+    pub segment_skipped_offsets: bool,
+
     /// Segments which are not found in the manifest, but it is tolerable because
     /// they are prior to the start of the manifest (i.e retention has removed them)
     pub segments_before_metadata: Vec<String>,
@@ -224,6 +227,7 @@ impl NTPDataScanResult {
             segments_before_metadata: vec![],
             segments_after_metadata: vec![],
             bad_offsets: false,
+            segment_skipped_offsets: false,
             compaction: false,
             transactions: false,
         }
@@ -321,6 +325,7 @@ async fn scan_data(
             let byte_stream = StreamReader::new(segment_stream_data);
 
             // Start of segment, compare offset with manifest
+            let mut segment_is_compacted = false;
             let meta_seg_opt = manifest_opt
                 .map(|m| m.get_segment(segment_obj.base_offset, segment_obj.original_term))
                 .unwrap_or(None);
@@ -337,6 +342,7 @@ async fn scan_data(
 
                 if meta_seg.is_compacted {
                     ntp_report.compaction = true;
+                    segment_is_compacted = true;
                 }
             } else {
                 if let Some(manifest) = manifest_opt {
@@ -402,16 +408,21 @@ async fn scan_data(
                     ntp_report.transactions = true;
                 }
 
-                if raw_offset > bb.header.base_offset as RawOffset {
-                    let header_base_offset = bb.header.base_offset;
+                let header_base_offset = bb.header.base_offset;
+                if raw_offset == bb.header.base_offset as RawOffset {
+                    raw_offset = bb.header.base_offset as RawOffset;
+                } else if raw_offset > header_base_offset as RawOffset {
                     warn!(
                         "[{}] Offset went backward {} -> {} in {}",
                         ntpr, raw_offset, header_base_offset, segment_obj.key
                     );
                     raw_offset = bb.header.base_offset as RawOffset;
-                } else {
-                    // Compaction: skip gap
-                    // TODO: complain if this happens in a segment whose meta doesn't say compacted=true
+                } else if (!segment_is_compacted) {
+                    warn!(
+                        "[{}] Offset jumped forward {} -> {} in {}",
+                        ntpr, raw_offset, header_base_offset, segment_obj.key
+                    );
+                    ntp_report.segment_skipped_offsets = true;
                     raw_offset = bb.header.base_offset as RawOffset;
                 };
 
