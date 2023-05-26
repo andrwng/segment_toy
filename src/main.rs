@@ -673,9 +673,9 @@ async fn scan_gaps(
     source: &str,
     meta_file: Option<&str>,
 ) -> Result<(), BucketReaderError> {
-    let mut reader = make_bucket_reader(cli, source, meta_file).await?;
+    let mut anomaly_reader = make_bucket_reader(cli, source, meta_file).await?;
 
-    reader.analyze_metadata(&cli.filter).await?;
+    anomaly_reader.analyze_metadata(&cli.filter).await?;
 
     #[derive(Serialize)]
     struct GapScan {
@@ -687,8 +687,9 @@ async fn scan_gaps(
     let mut results: Vec<GapScan> = Vec::new();
 
     let mut offset_gaps = HashMap::new();
-    std::mem::swap(&mut offset_gaps, &mut reader.anomalies.metadata_offset_gaps);
+    std::mem::swap(&mut offset_gaps, &mut anomaly_reader.anomalies.metadata_offset_gaps);
 
+    let reader = make_bucket_reader(cli, source, meta_file).await?;
     for (ntpr, gaps) in offset_gaps {
         let objects = if let Some(o) = reader.partitions.get(&ntpr) {
             o
