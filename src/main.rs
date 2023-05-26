@@ -250,6 +250,178 @@ impl NTPDataScanResult {
     }
 }
 
+async fn scan_for_missing_offsets(
+    cli: &Cli,
+    source: &str,
+    meta_file: Option<&str>,
+) -> Result<(), BucketReaderError> {
+    let bucket_reader = make_bucket_reader(cli, source, meta_file).await?;
+    let mut report: BTreeMap<NTPR, NTPDataScanResult> = BTreeMap::new();
+    for (ntpr, objects) in &bucket_reader.partitions {
+        if !cli.filter.match_ntpr(ntpr) {
+            continue;
+        }
+        info!(
+            "[{}] Checking data, starting at LWM raw={}", ntpr, 0
+        );
+
+        let mut ntp_report = NTPDataScanResult::new();
+
+        let mut estimate_ntp_size = 0;
+        let mut num_segments = 0;
+        for o in objects.segment_objects.values() {
+            estimate_ntp_size += o.size_bytes;
+            num_segments += 1;
+        }
+
+        let status_interval = std::time::Duration::from_secs(10);
+        let mut last_status = std::time::SystemTime::now();
+
+        // Iterate through the remote segments, checking for gaps.
+        let mut expected_next_rp_offset: RawOffset = 0;
+        let mut num_config_records: u64 = 0;
+        let mut segments_scanned = 0;
+        let mut metadata_discrepancy_found = false;
+        let metadata_opt = bucket_reader.partition_manifests.get(ntpr);
+        let manifest_opt = if let Some(metadata) = metadata_opt {
+            if let Some(manifest) = &metadata.head_manifest {
+                Some(manifest)
+            } else {
+                warn!("No head manifest found for NTP {}", ntpr);
+                ntp_report.metadata_missing = true;
+                metadata_discrepancy_found = true;
+                None
+            }
+        } else {
+            warn!("No metadata found for NTP {}", ntpr);
+            ntp_report.metadata_missing = true;
+            metadata_discrepancy_found = true;
+            None
+        };
+        let data_stream = bucket_reader.stream(ntpr);
+        pin_mut!(data_stream);
+        while let Some(segment_stream_struct) = data_stream.next().await {
+            let (segment_stream_data_r, segment_obj) = segment_stream_struct.into_parts();
+            segments_scanned += 1;
+
+            let segment_stream_data = match segment_stream_data_r {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("Cannot read segment {}: {}", segment_obj.key, e);
+                    // TODO: gracefully handle 404s by reloading manifest and checking again
+                    continue;
+                }
+            };
+            // Check metadata only if we haven't found issues already.
+            if !metadata_discrepancy_found {
+                let meta_seg_opt = manifest_opt
+                    .map(|m| m.get_segment(segment_obj.base_offset, segment_obj.original_term))
+                    .unwrap_or(None);
+                if let Some(meta_seg) = meta_seg_opt {
+                    if meta_seg.base_offset as RawOffset != expected_next_rp_offset {
+                            warn!("[{}] Segment {} has offset {}, expected next offset {}",
+                                ntpr, segment_obj.key, meta_seg.base_offset, expected_next_rp_offset
+                            );
+                            ntp_report.bad_offsets = true;
+                            metadata_discrepancy_found = true;
+                    }
+                    if let Some(seg_meta_delta) = meta_seg.delta_offset {
+                        if seg_meta_delta != num_config_records {
+                            warn!("[{}] Offset translation issue!  Segment {} doesn't have expected delta offset ({}, expected {})",
+                                ntpr, segment_obj.key, seg_meta_delta, num_config_records
+                            );
+                            ntp_report.bad_offsets = true;
+                            metadata_discrepancy_found = true;
+                        }
+                    }
+                    if meta_seg.is_compacted {
+                        ntp_report.compaction = true;
+                    }
+                }
+            }
+
+            // Scan through the batches of the segment, collecting offset and delta (num configs).
+            let byte_stream = StreamReader::new(segment_stream_data);
+            let mut batch_stream = BatchStream::new(byte_stream);
+            while let Ok(bb) = batch_stream.read_batch_buffer().await {
+                if (last_status.elapsed().unwrap()) > status_interval {
+                    info!(
+                        "[{}] Scanning segment {}/{}... {}/{} bytes",
+                        ntpr, segments_scanned, num_segments, ntp_report.bytes, estimate_ntp_size
+                    );
+                    last_status = std::time::SystemTime::now();
+                }
+
+                ntp_report.batches += 1;
+                ntp_report.bytes += bb.header.size_bytes as u64;
+                let mut is_data = true;
+                if bb.header.record_batch_type == RecordBatchType::ArchivalMetadata as i8 ||
+                    bb.header.record_batch_type == RecordBatchType::RaftConfig as i8 {
+                    is_data = false;
+                }
+
+                if bb.header.record_batch_type == RecordBatchType::TxPrepare as i8
+                    || bb.header.record_batch_type == RecordBatchType::TxFence as i8
+                {
+                    ntp_report.transactions = true;
+                }
+
+                let header_base_offset = bb.header.base_offset as RawOffset;
+                if expected_next_rp_offset > header_base_offset {
+                    warn!(
+                        "[{}] Offset went backward {} -> {} in {}",
+                        ntpr, expected_next_rp_offset, header_base_offset, segment_obj.key
+                    );
+                } else if expected_next_rp_offset < header_base_offset {
+                    warn!(
+                        "[{}] Offset jumped forward {} -> {} in {}",
+                        ntpr, expected_next_rp_offset, header_base_offset, segment_obj.key
+                    );
+                    ntp_report.segment_skipped_offsets = true;
+                }
+                if !is_data {
+                    num_config_records += bb.header.record_count as u64;
+                }
+                trace!("[{}] Batch {}", ntpr, bb.header);
+                ntp_report.records += bb.header.record_count as u64;
+                expected_next_rp_offset = header_base_offset + bb.header.record_count as RawOffset;
+            }
+        }
+        info!(
+            "[{}] Scanned {} records, HWM raw={}, num_configs={}",
+            ntpr, ntp_report.records, expected_next_rp_offset, num_config_records
+        );
+
+        report.insert(ntpr.clone(), ntp_report);
+    }
+    let mut topic_summaries: BTreeMap<NTR, DataScanTopicSummary> = BTreeMap::new();
+    for (ntpr, ntp_report) in &report {
+        let ntr = ntpr.to_ntr();
+        if !topic_summaries.contains_key(&ntr) {
+            topic_summaries.insert(ntr.clone(), DataScanTopicSummary::new());
+        }
+
+        let mut topic_summary = topic_summaries.get_mut(&ntr).unwrap();
+
+        topic_summary.size_bytes += ntp_report.bytes;
+        topic_summary.size_batches += ntp_report.batches;
+        topic_summary.size_records += ntp_report.records;
+
+        topic_summary.compaction = topic_summary.compaction || ntp_report.compaction;
+        topic_summary.transactions = topic_summary.transactions || ntp_report.transactions;
+        topic_summary.damaged = topic_summary.damaged || ntp_report.damaged();
+    }
+
+    let report = DataScanReport {
+        summary: topic_summaries,
+        ntps: report,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    Ok(())
+}
+
 /**
  * Walk the data in NTPs matching filter, compare with metadata
  * report anomalies.
@@ -693,7 +865,7 @@ async fn main() {
     let cli = Cli::parse();
     match &cli.command {
         Some(Commands::ScanData { source, meta_file }) => {
-            let r = scan_data(&cli, source, meta_file.as_ref().map(|s| s.as_str())).await;
+            let r = scan_for_missing_offsets(&cli, source, meta_file.as_ref().map(|s| s.as_str())).await;
             if let Err(e) = r {
                 error!("Error: {:?}", e);
                 std::process::exit(-1);
