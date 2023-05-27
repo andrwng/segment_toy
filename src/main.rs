@@ -17,8 +17,8 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::bucket_reader::{AnomalyStatus, BucketReader, MetadataGap, PartitionObjects};
-use crate::fundamental::{KafkaOffset, RawOffset, NTPR, NTR};
+use crate::bucket_reader::{AnomalyStatus, BucketReader, MetadataGap, PartitionMetadataSummary, PartitionObjects};
+use crate::fundamental::{KafkaOffset, RawOffset, NTP, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::PartitionManifest;
 use batch_reader::BatchStream;
@@ -96,6 +96,14 @@ enum Commands {
         source: String,
         #[arg(short, long)]
         meta_file: Option<String>,
+    },
+    CheckManifest {
+        #[arg(short, long)]
+        source: String,
+        #[arg(short, long)]
+        meta_file: String,
+        #[arg(short, long)]
+        path: String,
     },
     DecodePartitionManifest {
         #[arg(short, long)]
@@ -784,6 +792,43 @@ async fn analyze_metadata(
     Ok(())
 }
 
+async fn check_manifest(
+    cli: &Cli,
+    source: &str,
+    meta_file: &str,
+    path: &str,
+) -> Result<(), BucketReaderError> {
+    let mut f = tokio::fs::File::open(path).await.unwrap();
+    let mut buf: Vec<u8> = vec![];
+    f.read_to_end(&mut buf).await.unwrap();
+    let manifest = serde_json::from_slice::<PartitionManifest>(&buf).unwrap();
+    let ntpr = NTPR {
+        ntp: NTP {
+            namespace: manifest.namespace.clone(),
+            topic: manifest.topic.clone(),
+            partition_id: manifest.partition,
+        },
+        revision_id: manifest.revision,
+    };
+
+    let kafka_offsets = manifest.kafka_watermarks();
+    let summary = PartitionMetadataSummary {
+        bytes: manifest.get_size_bytes(),
+        raw_start_offset: manifest.start_offsets().0,
+        raw_last_offset: manifest.last_offset,
+        kafka_lwm: kafka_offsets.map(|x| x.0),
+        kafka_hwm: kafka_offsets.map(|x| x.1),
+    };
+    info!("File at path {}: {}", path, serde_json::to_string_pretty(&summary).unwrap());
+
+    let mut reader = make_bucket_reader(cli, source, Some(meta_file)).await?;
+    let ntp_filter = NTPFilter::for_ntpr(&ntpr);
+    reader.check_manifest(&manifest).await?;
+    reader.filter(&ntp_filter);
+    report_anomalies(source, reader);
+    Ok(())
+}
+
 async fn extract(
     cli: &Cli,
     source: &str,
@@ -909,6 +954,13 @@ async fn main() {
         }
         Some(Commands::AnalyzeMetadata { source, meta_file }) => {
             let r = analyze_metadata(&cli, source, meta_file).await;
+            if let Err(e) = r {
+                error!("Error: {:?}", e);
+                std::process::exit(-1);
+            }
+        }
+        Some(Commands::CheckManifest { source, meta_file, path }) => {
+            let r = check_manifest(&cli, source, meta_file, path).await;
             if let Err(e) = r {
                 error!("Error: {:?}", e);
                 std::process::exit(-1);

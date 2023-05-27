@@ -49,6 +49,14 @@ impl NTPFilter {
             revision: None,
         }
     }
+    pub fn for_ntpr(ntpr: &NTPR) -> NTPFilter {
+        NTPFilter {
+            ns: Some(ntpr.ntp.namespace.clone()),
+            topic: Some(Regex::new(&regex::escape(ntpr.ntp.topic.as_str())).unwrap()),
+            partition: Some(ntpr.ntp.partition_id),
+            revision: Some(ntpr.revision_id),
+        }
+    }
 
     fn init_opt_regex(input: &str) -> Result<Option<Regex>, regex::Error> {
         if input == "*" || input == ".*" {

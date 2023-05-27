@@ -737,6 +737,165 @@ impl BucketReader {
         // partitions they know where deleted+replaced
     }
 
+    pub async fn check_manifest(
+        &mut self,
+        partition_manifest: &PartitionManifest) -> Result<(), BucketReaderError> {
+        self.anomalies = Anomalies::new();
+        self.filter_old_revisions();
+        let ntpr = NTPR {
+            ntp: partition_manifest.ntp(),
+            revision_id: partition_manifest.revision,
+        };
+        let mut raw_objects = self.partitions.get_mut(&ntpr);
+        let mut discovered_objects: Vec<ObjectMeta> = vec![];
+        Self::_check_manifest(
+            self.client.clone(),
+            &mut raw_objects,
+            &mut discovered_objects,
+            &mut self.anomalies,
+            &ntpr,
+            partition_manifest).await?;
+        Ok(())
+    }
+
+
+    async fn _check_manifest(
+        client: Arc<dyn object_store::ObjectStore>,
+        raw_objects: &mut Option<&mut PartitionObjects>,
+        discovered_objects: &mut Vec<ObjectMeta>,
+        anomalies: &mut Anomalies,
+        ntpr: &NTPR,
+        partition_manifest: &PartitionManifest) -> Result<(), BucketReaderError> {
+        debug!(
+            "Checking {} ({} segments)",
+            partition_manifest.ntp(),
+            partition_manifest.segments.as_ref().map_or(0, |s| s.len())
+        );
+        if let Some(manifest_segments) = &partition_manifest.segments {
+            for (segment_short_name, segment) in manifest_segments {
+                if let Some(so) = partition_manifest.start_offset {
+                    if segment.committed_offset < so as u64 {
+                        debug!(
+                            "Not checking {} {}, it is below start offset",
+                            partition_manifest.ntp(),
+                            segment_short_name
+                        );
+                        continue;
+                    }
+                }
+
+                debug!(
+                    "Checking {} {}",
+                    partition_manifest.ntp(),
+                    segment_short_name
+                );
+                if let Some(expect_key) = partition_manifest.segment_key(segment) {
+                    debug!("Calculated segment {}", expect_key);
+                    if !Self::check_existence(
+                        client.clone(),
+                        raw_objects,
+                        segment.base_offset as RawOffset,
+                        &expect_key,
+                        discovered_objects,
+                    )
+                    .await?
+                    {
+                        anomalies.missing_segments.push(expect_key);
+                        // TODO: we should re-read manifest in case the segment
+                        // was legitimately GC'd while we were scanning
+                    }
+                }
+            }
+            // Inspect the manifest's offsets:
+            // - Deltas should be monotonic
+            // - Segment offsets should be continuous
+            let mut last_committed_offset: Option<RawOffset> = None;
+            let mut last_base_offset: Option<RawOffset> = None;
+            let mut last_max_timestamp = None;
+            let mut last_delta: Option<u64> = None;
+            let mut sorted_segments: Vec<&PartitionManifestSegment> =
+                manifest_segments.values().collect();
+            sorted_segments.sort_by_key(|s| s.base_offset);
+
+            for segment in sorted_segments {
+                if let Some(last_delta) = last_delta {
+                    match segment.delta_offset {
+                        None => {
+                            // After some segments have a delta offset, subsequent ones must
+                            // as well.
+                            warn!(
+                                "[{}] Segment {} has missing delta_offset",
+                                ntpr, segment.base_offset
+                            );
+                            anomalies.ntpr_bad_deltas.insert(ntpr.clone());
+                        }
+                        Some(seg_delta) => {
+                            if seg_delta < last_delta {
+                                warn!(
+                                    "[{}] Segment {} has delta lower than previous",
+                                    ntpr, segment.base_offset
+                                );
+                                anomalies.ntpr_bad_deltas.insert(ntpr.clone());
+                            }
+                        }
+                    }
+                }
+
+                if segment.delta_offset.is_some() && segment.delta_offset_end.is_some() {
+                    let d_off = segment.delta_offset.unwrap();
+                    let d_off_end = segment.delta_offset_end.unwrap();
+                    if d_off > d_off_end {
+                        warn!(
+                            "[{}] Segment {} has end delta lower than base delta",
+                            ntpr, segment.base_offset
+                        );
+                        anomalies.ntpr_bad_deltas.insert(ntpr.clone());
+                    }
+                }
+
+                if let Some(last_committed_offset) = last_committed_offset {
+                    if segment.base_offset as RawOffset > last_committed_offset + 1 {
+                        let ts = SystemTime::UNIX_EPOCH
+                            .add(Duration::from_millis(segment.base_timestamp.unwrap_or(0)));
+                        let dt: chrono::DateTime<Utc> = ts.into();
+
+                        warn!(
+                            "[{}] Segment {} has gap between base offset and previous segment's committed offset ({}).  Missing {} records, from ts {} to ts {} ({})",
+                            ntpr,
+                            segment.base_offset,
+                            last_committed_offset,
+                            segment.base_offset as RawOffset - (last_committed_offset + 1),
+                            last_max_timestamp.unwrap_or(0),
+                            segment.base_timestamp.unwrap_or(0),
+                            dt.to_rfc3339());
+                        let gap_list = anomalies
+                            .metadata_offset_gaps
+                            .entry(ntpr.clone())
+                            .or_insert_with(|| Vec::new());
+                        gap_list.push(MetadataGap {
+                            next_seg_base: segment.base_offset as RawOffset,
+                            next_seg_ts: segment.base_timestamp.unwrap_or(0) as Timestamp,
+                            prev_seg_committed: last_committed_offset,
+                            prev_seg_base: last_base_offset.unwrap(),
+                        });
+                    } else if (segment.base_offset as RawOffset) < last_committed_offset + 1 {
+                        warn!(
+                            "[{}] Segment {} has overlap between base offset and previous segment's committed offset ({})",
+                            ntpr, segment.base_offset, last_committed_offset
+                        );
+                        anomalies.ntpr_overlap_offsets.insert(ntpr.clone());
+                    }
+                }
+
+                last_delta = segment.delta_offset_end;
+                last_base_offset = Some(segment.base_offset as RawOffset);
+                last_committed_offset = Some(segment.committed_offset as RawOffset);
+                last_max_timestamp = segment.max_timestamp;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn analyze_metadata(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
         // In case caller calls it twice
         self.anomalies = Anomalies::new();
@@ -815,7 +974,6 @@ impl BucketReader {
                     continue;
                 }
             };
-
             let mut raw_objects = self.partitions.get_mut(&ntpr);
 
             // For all segments in the manifest, check they were found in the bucket
@@ -824,129 +982,13 @@ impl BucketReader {
                 partition_manifest.ntp(),
                 partition_manifest.segments.as_ref().map_or(0, |s| s.len())
             );
-            if let Some(manifest_segments) = &partition_manifest.segments {
-                for (segment_short_name, segment) in manifest_segments {
-                    if let Some(so) = partition_manifest.start_offset {
-                        if segment.committed_offset < so as u64 {
-                            debug!(
-                                "Not checking {} {}, it is below start offset",
-                                partition_manifest.ntp(),
-                                segment_short_name
-                            );
-                            continue;
-                        }
-                    }
-
-                    debug!(
-                        "Checking {} {}",
-                        partition_manifest.ntp(),
-                        segment_short_name
-                    );
-                    if let Some(expect_key) = partition_manifest.segment_key(segment) {
-                        debug!("Calculated segment {}", expect_key);
-                        if !Self::check_existence(
-                            self.client.clone(),
-                            &mut raw_objects,
-                            segment.base_offset as RawOffset,
-                            &expect_key,
-                            &mut discovered_objects,
-                        )
-                        .await?
-                        {
-                            self.anomalies.missing_segments.push(expect_key);
-                            // TODO: we should re-read manifest in case the segment
-                            // was legitimately GC'd while we were scanning
-                        }
-                    }
-                }
-                // Inspect the manifest's offsets:
-                // - Deltas should be monotonic
-                // - Segment offsets should be continuous
-                let mut last_committed_offset: Option<RawOffset> = None;
-                let mut last_base_offset: Option<RawOffset> = None;
-                let mut last_max_timestamp = None;
-                let mut last_delta: Option<u64> = None;
-                let mut sorted_segments: Vec<&PartitionManifestSegment> =
-                    manifest_segments.values().collect();
-                sorted_segments.sort_by_key(|s| s.base_offset);
-
-                for segment in sorted_segments {
-                    if let Some(last_delta) = last_delta {
-                        match segment.delta_offset {
-                            None => {
-                                // After some segments have a delta offset, subsequent ones must
-                                // as well.
-                                warn!(
-                                    "[{}] Segment {} has missing delta_offset",
-                                    ntpr, segment.base_offset
-                                );
-                                self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
-                            }
-                            Some(seg_delta) => {
-                                if seg_delta < last_delta {
-                                    warn!(
-                                        "[{}] Segment {} has delta lower than previous",
-                                        ntpr, segment.base_offset
-                                    );
-                                    self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
-                                }
-                            }
-                        }
-                    }
-
-                    if segment.delta_offset.is_some() && segment.delta_offset_end.is_some() {
-                        let d_off = segment.delta_offset.unwrap();
-                        let d_off_end = segment.delta_offset_end.unwrap();
-                        if d_off > d_off_end {
-                            warn!(
-                                "[{}] Segment {} has end delta lower than base delta",
-                                ntpr, segment.base_offset
-                            );
-                            self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
-                        }
-                    }
-
-                    if let Some(last_committed_offset) = last_committed_offset {
-                        if segment.base_offset as RawOffset > last_committed_offset + 1 {
-                            let ts = SystemTime::UNIX_EPOCH
-                                .add(Duration::from_millis(segment.base_timestamp.unwrap_or(0)));
-                            let dt: chrono::DateTime<Utc> = ts.into();
-
-                            warn!(
-                                "[{}] Segment {} has gap between base offset and previous segment's committed offset ({}).  Missing {} records, from ts {} to ts {} ({})",
-                                ntpr,
-                                segment.base_offset,
-                                last_committed_offset,
-                                segment.base_offset as RawOffset - (last_committed_offset + 1),
-                                last_max_timestamp.unwrap_or(0),
-                                segment.base_timestamp.unwrap_or(0),
-                                dt.to_rfc3339());
-                            let gap_list = self
-                                .anomalies
-                                .metadata_offset_gaps
-                                .entry(ntpr.clone())
-                                .or_insert_with(|| Vec::new());
-                            gap_list.push(MetadataGap {
-                                next_seg_base: segment.base_offset as RawOffset,
-                                next_seg_ts: segment.base_timestamp.unwrap_or(0) as Timestamp,
-                                prev_seg_committed: last_committed_offset,
-                                prev_seg_base: last_base_offset.unwrap(),
-                            });
-                        } else if (segment.base_offset as RawOffset) < last_committed_offset + 1 {
-                            warn!(
-                                "[{}] Segment {} has overlap between base offset and previous segment's committed offset ({})",
-                                ntpr, segment.base_offset, last_committed_offset
-                            );
-                            self.anomalies.ntpr_overlap_offsets.insert(ntpr.clone());
-                        }
-                    }
-
-                    last_delta = segment.delta_offset_end;
-                    last_base_offset = Some(segment.base_offset as RawOffset);
-                    last_committed_offset = Some(segment.committed_offset as RawOffset);
-                    last_max_timestamp = segment.max_timestamp;
-                }
-            }
+            Self::_check_manifest(
+                self.client.clone(),
+                &mut raw_objects,
+                &mut discovered_objects,
+                &mut self.anomalies,
+                ntpr,
+                partition_manifest).await?;
         }
 
         for (ntpr, _) in &mut self.partition_manifests {
