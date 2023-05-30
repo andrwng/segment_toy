@@ -408,16 +408,15 @@ impl BucketReader {
             {
                 manifest
             } else {
-                warn!("No manifests for cluster {}", cluster_uuid);
-                self.anomalies
-                    .inconsistent_cluster_metadata
-                    .push(meta.clone());
+                debug!("No manifests for cluster {}", cluster_uuid);
                 continue;
             };
-            if highest_manifest.controller_snapshot_path.is_empty() {
-                if highest_manifest.controller_snapshot_path.is_empty() {
+            if !highest_manifest.controller_snapshot_path.is_empty() {
+                if meta.controller_snapshots.is_empty() {
                     debug!("No controller snapshot for cluster {}", cluster_uuid);
                 } else {
+                    // If there's a manifest and there are also controller snapshots, the manifest
+                    // must point to a controller snapshot.
                     warn!(
                         "Cluster {} has {} controller snapshots but manifest is empty",
                         cluster_uuid,
