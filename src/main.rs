@@ -443,6 +443,9 @@ async fn scan_data_ntp(
         if let Some(meta_seg) = meta_seg_opt {
             if let Some(seg_meta_delta) = meta_seg.delta_offset {
                 let seg_meta_kafka_base = meta_seg.base_offset - seg_meta_delta;
+                info!("AWONG: base: {}, delta: {}, b-d: {}",
+                      segment_obj.base_offset, seg_meta_delta,
+                      segment_obj.base_offset - seg_meta_delta as RawOffset);
                 if seg_meta_kafka_base != kafka_offset as u64 {
                     warn!("[{}] Offset translation issue!  At offset {}, but segment meta says {} (segment {})",
                             ntpr, kafka_offset, seg_meta_kafka_base, segment_obj.key
@@ -574,8 +577,10 @@ async fn scan_data_ntp(
                                     && gap_end == curr_seg.base_offset as RawOffset - 1
                                 {
                                     info!(
-                                        "[{}] Detected clean data gap betwen segments {} and {}",
-                                        ntpr, prev_seg.base_offset, curr_seg.base_offset
+                                        "[{}] Detected clean data gap betwen segments {} and {}, gap offsets {} - {}, first kafka offset after gap {}",
+                                        ntpr, prev_seg.base_offset, curr_seg.base_offset,
+                                        gap_begin, gap_end,
+                                        curr_seg.base_offset - curr_seg.delta_offset.unwrap()
                                     );
                                     let non_data_records = curr_seg.delta_offset.unwrap_or(0)
                                         as i64
