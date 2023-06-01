@@ -246,6 +246,9 @@ pub struct Anomalies {
 
     /// NTPR that failed consistency checks on its segments' metadata
     pub ntpr_bad_deltas: HashSet<NTPR>,
+    pub ntpr_missing_delta_offset: HashSet<NTPR>,
+    pub ntpr_delta_goes_down: HashSet<NTPR>,
+    pub ntpr_delta_end_goes_down: HashSet<NTPR>,
 
     /// Consistency checks found overlapping segments, which may be readable but
     /// indicate a bug in the code that wrote them.
@@ -256,6 +259,11 @@ pub struct Anomalies {
     /// used to cue subsequent data scans.
     /// Ref Incident 259
     pub metadata_offset_gaps: HashMap<NTPR, Vec<MetadataGap>>,
+
+    // Where a partition manifest has two segments whose delta offset decreases, indicating a
+    // logical _increase_ in Kafka offset. This may be seen on consumers as a gap in consumed
+    // output.
+    //  pub kafka_offset_gaps: HashMap<NTPR, Vec<MetadataGap>>,
 }
 /// A convenience for human beings who would like to know things like the total amount of
 /// data in each partition
@@ -284,6 +292,9 @@ impl Anomalies {
             || !self.malformed_topic_manifests.is_empty()
             || !self.missing_segments.is_empty()
             || !self.ntpr_bad_deltas.is_empty()
+            || !self.ntpr_missing_delta_offset.is_empty()
+            || !self.ntpr_delta_goes_down.is_empty()
+            || !self.ntpr_delta_end_goes_down.is_empty()
             || !self.metadata_offset_gaps.is_empty()
         {
             AnomalyStatus::Corrupt
@@ -359,6 +370,18 @@ impl Anomalies {
             &self.ntpr_bad_deltas,
         ));
         result.push_str(&Self::report_line(
+            "NTPs with missing offset deltas",
+            &self.ntpr_missing_delta_offset,
+        ));
+        result.push_str(&Self::report_line(
+            "NTPs where the delta_offset between segments goes down",
+            &self.ntpr_delta_goes_down,
+        ));
+        result.push_str(&Self::report_line(
+            "NTPs where the delta_offset_end is lower than the delta_offset of a segment",
+            &self.ntpr_delta_end_goes_down,
+        ));
+        result.push_str(&Self::report_line(
             "Overlapping offset ranges, possible upload bug",
             &self.ntpr_overlap_offsets,
         ));
@@ -393,6 +416,9 @@ impl Anomalies {
             unknown_keys: vec![],
             missing_segments: vec![],
             ntpr_bad_deltas: HashSet::new(),
+            ntpr_missing_delta_offset: HashSet::new(),
+            ntpr_delta_goes_down: HashSet::new(),
+            ntpr_delta_end_goes_down: HashSet::new(),
             ntpr_overlap_offsets: HashSet::new(),
             metadata_offset_gaps: HashMap::new(),
         }
@@ -942,6 +968,8 @@ impl BucketReader {
                 manifest_segments.values().collect();
             sorted_segments.sort_by_key(|s| s.base_offset);
 
+            let mut last_kafka_end: Option<KafkaOffset> = None;
+
             for segment in sorted_segments {
                 if let Some(last_delta) = last_delta {
                     match segment.delta_offset {
@@ -950,17 +978,27 @@ impl BucketReader {
                             // as well.
                             warn!(
                                 "[{}] Segment {} has missing delta_offset",
-                                ntpr, segment.base_offset
+                                ntpr, segment.base_offset,
                             );
-                            self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
+                            self.anomalies.ntpr_missing_delta_offset.insert(ntpr.clone());
                         }
                         Some(seg_delta) => {
                             if seg_delta < last_delta {
-                                warn!(
-                                    "[{}] Segment {} has delta lower than previous",
-                                    ntpr, segment.base_offset
+                                warn!("{} {} AWONG consume {} -p {} -o {}:{} --fetch-max-wait 60s --config ~/.secrets/gold/gold.yaml -f \"%o\n\"",
+                                      last_kafka_end.unwrap(),
+                                      segment.base_offset - seg_delta as RawOffset,
+                                      ntpr.ntp.topic, ntpr.ntp.partition_id, 
+                                      last_base_offset.unwrap() - last_delta as RawOffset,
+                                      // Consume one past the gap.
+                                      segment.base_offset + 1 - seg_delta as RawOffset,
                                 );
-                                self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
+                                warn!(
+                                    "[{}] Segment {} has delta lower than previous. Previous kafka base: {}, curr kafka base: {}",
+                                    ntpr, segment.base_offset,
+                                    last_base_offset.unwrap() - last_delta as RawOffset,
+                                    segment.base_offset - seg_delta as RawOffset
+                                );
+                                self.anomalies.ntpr_delta_goes_down.insert(ntpr.clone());
                             }
                         }
                     }
@@ -974,7 +1012,7 @@ impl BucketReader {
                             "[{}] Segment {} has end delta lower than base delta",
                             ntpr, segment.base_offset
                         );
-                        self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
+                        self.anomalies.ntpr_delta_end_goes_down.insert(ntpr.clone());
                     }
                 }
 
@@ -1027,6 +1065,9 @@ impl BucketReader {
                 last_base_offset = Some(segment.base_offset as RawOffset);
                 last_committed_offset = Some(segment.committed_offset as RawOffset);
                 last_max_timestamp = segment.max_timestamp;
+                if let Some(delta_end) = last_delta {
+                    last_kafka_end = Some(last_committed_offset.unwrap() - delta_end as RawOffset);
+                }
             }
         }
 
