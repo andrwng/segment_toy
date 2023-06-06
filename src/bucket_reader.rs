@@ -985,15 +985,17 @@ impl BucketReader {
                         ));
                         let dt: chrono::DateTime<Utc> = ts.into();
 
+                        let rp_gap_size = segment.base_offset as RawOffset - (last_committed_offset + 1);
                         warn!(
                                 "[{}] Segment {} has gap between base offset and previous segment's committed offset ({}).  Missing {} records, from ts {} to ts {} ({})",
                                 ntpr,
                                 segment.base_offset,
                                 last_committed_offset,
-                                segment.base_offset as RawOffset - (last_committed_offset + 1),
+                                rp_gap_size,
                                 last_max_timestamp.unwrap_or(0),
                                 segment.base_timestamp.unwrap_or(0),
                                 dt.to_rfc3339());
+
                         let gap_list = self
                             .anomalies
                             .metadata_offset_gaps
@@ -1005,6 +1007,10 @@ impl BucketReader {
                         let kafka_gap_end = segment
                             .delta_offset
                             .map(|d| raw_to_kafka(segment.base_offset, d));
+
+
+                        let kafka_gap_start_estimate = (kafka_gap_end.unwrap() - rp_gap_size).max(0);
+                        warn!("AWONG kafka offset gap {} {} {}", ntpr.clone(), kafka_gap_start_estimate, kafka_gap_end.unwrap());
 
                         gap_list.push(MetadataGap {
                             next_seg_base: segment.base_offset as RawOffset,
